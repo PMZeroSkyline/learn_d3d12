@@ -5,15 +5,16 @@ add_definitions(-DUNICODE -D_UNICODE)
 
 include_directories(
     source
+    extern/D3D12MemoryAllocator/include
+    extern/D3D12MemoryAllocator/src
 )
-# file(GLOB_RECURSE SRC
-#     source/*.cpp
-# )
-# add_executable(learn_d3d12
-#     ${SRC}
-# )
+file(GLOB_RECURSE D3D12MA_SRC
+    extern/D3D12MemoryAllocator/src/*.cpp
+)
 add_executable(learn_d3d12
-    source/texture.cpp
+    # extern/D3D12MemoryAllocator/src/D3D12MemAlloc.cpp
+    # ${D3D12MA_SRC}
+    source/msaa_offscreen.cpp
 )
 target_link_libraries(learn_d3d12 
     d3d12 
@@ -22,5 +23,6 @@ target_link_libraries(learn_d3d12
     d3dcompiler 
     user32 
     gdi32
+    shlwapi.lib # for D3D12Sample StrStrI
 )
 
