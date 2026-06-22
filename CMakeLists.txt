@@ -14,7 +14,7 @@ file(GLOB_RECURSE D3D12MA_SRC
 add_executable(learn_d3d12
     # extern/D3D12MemoryAllocator/src/D3D12MemAlloc.cpp
     # ${D3D12MA_SRC}
-    source/msaa_offscreen.cpp
+    source/bindless.cpp
 )
 target_link_libraries(learn_d3d12 
     d3d12 
