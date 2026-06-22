@@ -57,21 +57,6 @@ UINT g_FrameIndex = 0;
 HANDLE g_FenceEvent;
 ComPtr<ID3D12Fence> g_Fence;
 UINT64 g_FenceValues[FrameCount] = { 0, 0 };
-
-// Helper function to read compiled shader binary files
-std::vector<char> ReadBinaryFile(const std::wstring& filename)
-{
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file.is_open())
-    {
-        throw std::runtime_error("Failed to open shader file. Ensure vs.cso/ps.cso are in the executable directory.");
-    }
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    std::vector<char> buffer(size);
-    file.read(buffer.data(), size);
-    return buffer;
-}
 // Win32 Window message handling function
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -110,6 +95,21 @@ void MoveToNextFrame()
 
     g_FenceValues[g_FrameIndex] = currentFenceValue + 1;
 }
+// Helper function to read compiled shader binary files
+std::vector<char> ReadBinaryFile(const std::wstring& filename)
+{
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+    {
+        throw std::runtime_error("Failed to open shader file. Ensure vs.cso/ps.cso are in the executable directory.");
+    }
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<char> buffer(size);
+    file.read(buffer.data(), size);
+    return buffer;
+}
+
 int main(int argc, char** argv)
 {
     fs::current_path(fs::current_path().parent_path().parent_path());
@@ -131,7 +131,7 @@ int main(int argc, char** argv)
 
     HWND hWnd = CreateWindowW(
         L"BindlessSampleWindowClass",
-        L"D3D12 SM 5.1/6.0 Unbounded Array Bindless Sample",
+        L"D3D12 SM 6.6 Direct Indexing Bindless Sample",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rc.right - rc.left, rc.bottom - rc.top,
@@ -216,34 +216,32 @@ int main(int argc, char** argv)
         g_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_CommandAllocators[n]));
     }
 
-    // Root Signature Construction
-    // Restoring the descriptor table representation in root signature to map arrays
-    CD3DX12_DESCRIPTOR_RANGE1 ranges[2];
-    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0); 
-    ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 1000); 
-
-    CD3DX12_ROOT_PARAMETER1 rootParameters[2];
-    rootParameters[0].InitAsConstants(2, 0, 0, D3D12_SHADER_VISIBILITY_ALL); // b0, space0: Root Constants
-    rootParameters[1].InitAsDescriptorTable(2, ranges, D3D12_SHADER_VISIBILITY_ALL); // Table mapping space0 and space1
+    // Root Signature Construction for SM 6.6 Direct Indexing
+    // We only need Root Constants. No Descriptor Tables are needed.
+    CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+    rootParameters[0].InitAsConstants(2, 0, 0, D3D12_SHADER_VISIBILITY_ALL); // b0, space0: 2 root constants (Indices)
 
     CD3DX12_STATIC_SAMPLER_DESC staticSampler(0, D3D12_FILTER_MIN_MAG_MIP_POINT);
 
+    // Define the SM 6.6 direct indexing flag
+    D3D12_ROOT_SIGNATURE_FLAGS rootSigFlags = 
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED; // This flag resolves Error X3596 / PSO creation failure
+
     CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc;
-    // Reverted flag from DIRECT_INDEXED back to NONE
-    rootSigDesc.Init_1_1(_countof(rootParameters), rootParameters, 1, &staticSampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    rootSigDesc.Init_1_1(_countof(rootParameters), rootParameters, 1, &staticSampler, rootSigFlags);
 
     ComPtr<ID3DBlob> signature;
     ComPtr<ID3DBlob> error;
     D3D12SerializeVersionedRootSignature(&rootSigDesc, &signature, &error);
     g_Device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_RootSignature));
 
-    // Load Precompiled SM 5.1 / 6.0 Shaders from disk
+    // Load Precompiled SM 6.6 Shaders from disk
     std::vector<char> vsBytecode;
     std::vector<char> psBytecode;
     try
     {
-        vsBytecode = ReadBinaryFile(L"source/bindless_vs.cso");
-        psBytecode = ReadBinaryFile(L"source/bindless_ps.cso");
+        vsBytecode = ReadBinaryFile(L"source/bindless_vs_6_6.sco");
+        psBytecode = ReadBinaryFile(L"source/bindless_ps_6_6.sco");
     }
     catch (const std::exception& e)
     {
@@ -445,13 +443,11 @@ int main(int argc, char** argv)
             ID3D12DescriptorHeap* heaps[] = { g_SrvHeap.Get() };
             g_CommandList->SetDescriptorHeaps(_countof(heaps), heaps);
 
-            // Parameter 1: Bind the global descriptor heap start to the root descriptor table
-            g_CommandList->SetGraphicsRootDescriptorTable(1, g_SrvHeap->GetGPUDescriptorHandleForHeapStart());
-
-            // Parameter 0: Bindless index constants mapping to resources dynamically
+            // In SM 6.6, no Root Descriptor Table needs to be bound.
+            // We only send the direct dynamic indices via root constants.
             BindlessIndices indices = {};
-            indices.vertexBufferIndex = 0;     // descriptor index 0
-            indices.textureIndex = 0;          // descriptor index 1000 in the heap (mapped inside space1, index 0)
+            indices.vertexBufferIndex = 0;     // Pointing to Vertex Buffer SRV (descriptor index 0)
+            indices.textureIndex = 0;          // Pointing to Texture SRV (descriptor index 1000 in the heap)
             g_CommandList->SetGraphicsRoot32BitConstants(0, 2, &indices, 0);
 
             // Draw full geometry directly

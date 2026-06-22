@@ -2,17 +2,14 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <d3dcompiler.h>
 #include <wrl/client.h>
-#include <vector>
-#include <string>
-#include <fstream>
 #include <iostream>
-#include <stdexcept>
-#include <filesystem>
-namespace fs = std::filesystem;
+#include <vector>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -33,8 +30,8 @@ struct BindlessIndices {
 };
 
 // Global Direct3D 12 Variables
-ComPtr<ID3D12Device> g_Device;
 ComPtr<IDXGIFactory4> g_Factory;
+ComPtr<ID3D12Device> g_Device;
 ComPtr<ID3D12CommandQueue> g_CommandQueue;
 ComPtr<IDXGISwapChain3> g_SwapChain;
 ComPtr<ID3D12DescriptorHeap> g_RtvHeap;
@@ -58,62 +55,57 @@ HANDLE g_FenceEvent;
 ComPtr<ID3D12Fence> g_Fence;
 UINT64 g_FenceValues[FrameCount] = { 0, 0 };
 
-// Helper function to read compiled shader binary files
-std::vector<char> ReadBinaryFile(const std::wstring& filename)
+// HLSL Shaders with bounded arrays for SM 5.1 compatibility
+const char* g_ShaderSource = R"(
+struct VSInput {
+    uint vertexID : SV_VertexID;
+};
+
+struct PSInput {
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD;
+};
+
+// Traditional constant buffer structure compatible with legacy compilers
+cbuffer BindlessIndices : register(b0)
 {
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file.is_open())
-    {
-        throw std::runtime_error("Failed to open shader file. Ensure vs.cso/ps.cso are in the executable directory.");
-    }
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    std::vector<char> buffer(size);
-    file.read(buffer.data(), size);
-    return buffer;
-}
-// Win32 Window message handling function
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    switch (message)
-    {
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
-    }
-}
+    uint g_vertexBufferIdx;
+    uint g_textureIdx;
+};
 
-// Ensure complete graphics pipeline synchronization
-void WaitForGpu()
-{
-    g_CommandQueue->Signal(g_Fence.Get(), g_FenceValues[g_FrameIndex]);
-    g_Fence->SetEventOnCompletion(g_FenceValues[g_FrameIndex], g_FenceEvent);
-    WaitForSingleObjectEx(g_FenceEvent, INFINITE, FALSE);
-    g_FenceValues[g_FrameIndex]++;
+// Bounded descriptor arrays of size 1000 to satisfy the compiler and diagnostic tools
+ByteAddressBuffer g_ByteAddressBuffers[1000] : register(t0, space0);
+Texture2D         g_Textures2D[1000]         : register(t0, space1);
+SamplerState      g_Sampler                  : register(s0);
+
+PSInput VSMain(VSInput input) {
+    PSInput result;
+    
+    // Each vertex consists of 5 floats (3 position, 2 UV) = 20 bytes
+    uint offset = input.vertexID * 20;
+    
+    // Direct array indexing
+    float3 pos = asfloat(g_ByteAddressBuffers[g_vertexBufferIdx].Load3(offset));
+    float2 uv = asfloat(g_ByteAddressBuffers[g_vertexBufferIdx].Load2(offset + 12));
+    
+    result.position = float4(pos, 1.0f);
+    result.uv = uv;
+    return result;
 }
 
-// Frame pacing for the swap chain backbuffers
-void MoveToNextFrame()
-{
-    const UINT64 currentFenceValue = g_FenceValues[g_FrameIndex];
-    g_CommandQueue->Signal(g_Fence.Get(), currentFenceValue);
-
-    g_FrameIndex = g_SwapChain->GetCurrentBackBufferIndex();
-
-    if (g_Fence->GetCompletedValue() < g_FenceValues[g_FrameIndex])
-    {
-        g_Fence->SetEventOnCompletion(g_FenceValues[g_FrameIndex], g_FenceEvent);
-        WaitForSingleObjectEx(g_FenceEvent, INFINITE, FALSE);
-    }
-
-    g_FenceValues[g_FrameIndex] = currentFenceValue + 1;
+float4 PSMain(PSInput input) : SV_TARGET {
+    // Direct array indexing compatible with SM 5.1 compilation
+    return g_Textures2D[g_textureIdx].Sample(g_Sampler, input.uv);
 }
+)";
+
+// Forward declarations
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
+void WaitForGpu();
+void MoveToNextFrame();
+
 int main(int argc, char** argv)
 {
-    fs::current_path(fs::current_path().parent_path().parent_path());
-
     HINSTANCE hI = GetModuleHandle(NULL);
 
     // Initialize Win32 Window
@@ -131,7 +123,7 @@ int main(int argc, char** argv)
 
     HWND hWnd = CreateWindowW(
         L"BindlessSampleWindowClass",
-        L"D3D12 SM 5.1/6.0 Unbounded Array Bindless Sample",
+        L"D3D12 Bindless Resources Sample",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rc.right - rc.left, rc.bottom - rc.top,
@@ -190,6 +182,7 @@ int main(int argc, char** argv)
     g_FrameIndex = g_SwapChain->GetCurrentBackBufferIndex();
 
     // Descriptor Heaps Setup
+    // RTV Descriptor Heap
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
     rtvHeapDesc.NumDescriptors = FrameCount;
     rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -217,19 +210,17 @@ int main(int argc, char** argv)
     }
 
     // Root Signature Construction
-    // Restoring the descriptor table representation in root signature to map arrays
     CD3DX12_DESCRIPTOR_RANGE1 ranges[2];
-    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0); 
-    ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 1000); 
+    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1000, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE); 
+    ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1000, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE); 
 
     CD3DX12_ROOT_PARAMETER1 rootParameters[2];
-    rootParameters[0].InitAsConstants(2, 0, 0, D3D12_SHADER_VISIBILITY_ALL); // b0, space0: Root Constants
-    rootParameters[1].InitAsDescriptorTable(2, ranges, D3D12_SHADER_VISIBILITY_ALL); // Table mapping space0 and space1
+    rootParameters[0].InitAsConstants(2, 0, 0, D3D12_SHADER_VISIBILITY_ALL); // b0, space0
+    rootParameters[1].InitAsDescriptorTable(2, ranges, D3D12_SHADER_VISIBILITY_ALL);
 
     CD3DX12_STATIC_SAMPLER_DESC staticSampler(0, D3D12_FILTER_MIN_MAG_MIP_POINT);
 
     CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc;
-    // Reverted flag from DIRECT_INDEXED back to NONE
     rootSigDesc.Init_1_1(_countof(rootParameters), rootParameters, 1, &staticSampler, D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
     ComPtr<ID3DBlob> signature;
@@ -237,17 +228,30 @@ int main(int argc, char** argv)
     D3D12SerializeVersionedRootSignature(&rootSigDesc, &signature, &error);
     g_Device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_RootSignature));
 
-    // Load Precompiled SM 5.1 / 6.0 Shaders from disk
-    std::vector<char> vsBytecode;
-    std::vector<char> psBytecode;
-    try
+    // Compile Shaders with error diagnostic handling
+    ComPtr<ID3DBlob> vertexShader;
+    ComPtr<ID3DBlob> vsError;
+    HRESULT hrVS = D3DCompile(g_ShaderSource, strlen(g_ShaderSource), nullptr, nullptr, nullptr, "VSMain", "vs_5_1", 0, 0, &vertexShader, &vsError);
+    if (FAILED(hrVS))
     {
-        vsBytecode = ReadBinaryFile(L"source/bindless_vs.cso");
-        psBytecode = ReadBinaryFile(L"source/bindless_ps.cso");
+        if (vsError)
+        {
+            OutputDebugStringA(static_cast<const char*>(vsError->GetBufferPointer()));
+            std::cerr << "Vertex Shader Compilation Error:\n" << static_cast<const char*>(vsError->GetBufferPointer()) << std::endl;
+        }
+        return -1;
     }
-    catch (const std::exception& e)
+
+    ComPtr<ID3DBlob> pixelShader;
+    ComPtr<ID3DBlob> psError;
+    HRESULT hrPS = D3DCompile(g_ShaderSource, strlen(g_ShaderSource), nullptr, nullptr, nullptr, "PSMain", "ps_5_1", 0, 0, &pixelShader, &psError);
+    if (FAILED(hrPS))
     {
-        MessageBoxA(hWnd, e.what(), "Initialization Error", MB_OK | MB_ICONERROR);
+        if (psError)
+        {
+            OutputDebugStringA(static_cast<const char*>(psError->GetBufferPointer()));
+            std::cerr << "Pixel Shader Compilation Error:\n" << static_cast<const char*>(psError->GetBufferPointer()) << std::endl;
+        }
         return -1;
     }
 
@@ -255,8 +259,8 @@ int main(int argc, char** argv)
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
     psoDesc.InputLayout = { nullptr, 0 };
     psoDesc.pRootSignature = g_RootSignature.Get();
-    psoDesc.VS = { vsBytecode.data(), vsBytecode.size() };
-    psoDesc.PS = { psBytecode.data(), psBytecode.size() };
+    psoDesc.VS = CD3DX12_SHADER_BYTECODE(vertexShader.Get());
+    psoDesc.PS = CD3DX12_SHADER_BYTECODE(pixelShader.Get());
     psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
     psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     psoDesc.DepthStencilState.DepthEnable = FALSE;
@@ -279,7 +283,7 @@ int main(int argc, char** argv)
     };
     const UINT vertexBufferSize = sizeof(vertices);
 
-    // Allocate Vertex Buffer
+    // Allocate Vertex Buffer in an upload-compatible state
     CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
     CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(vertexBufferSize);
     g_Device->CreateCommittedResource(
@@ -291,7 +295,7 @@ int main(int argc, char** argv)
         IID_PPV_ARGS(&g_VertexBuffer)
     );
 
-    // Copy vertex data
+    // Copy vertex data to CPU-mapped pointer
     void* pVertexDataBegin = nullptr;
     g_VertexBuffer->Map(0, nullptr, &pVertexDataBegin);
     memcpy(pVertexDataBegin, vertices, sizeof(vertices));
@@ -440,21 +444,21 @@ int main(int argc, char** argv)
             const float clearColor[] = { 0.15f, 0.15f, 0.15f, 1.0f };
             g_CommandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
-            // Bind root signature and the global shader-visible descriptor heap
+            // Set root signature and dynamic shader descriptor heaps
             g_CommandList->SetGraphicsRootSignature(g_RootSignature.Get());
             ID3D12DescriptorHeap* heaps[] = { g_SrvHeap.Get() };
             g_CommandList->SetDescriptorHeaps(_countof(heaps), heaps);
 
-            // Parameter 1: Bind the global descriptor heap start to the root descriptor table
+            // Parameter 1: Bind global descriptor heap start
             g_CommandList->SetGraphicsRootDescriptorTable(1, g_SrvHeap->GetGPUDescriptorHandleForHeapStart());
 
             // Parameter 0: Bindless index constants mapping to resources dynamically
             BindlessIndices indices = {};
-            indices.vertexBufferIndex = 0;     // descriptor index 0
-            indices.textureIndex = 0;          // descriptor index 1000 in the heap (mapped inside space1, index 0)
+            indices.vertexBufferIndex = 0; 
+            indices.textureIndex = 0;      
             g_CommandList->SetGraphicsRoot32BitConstants(0, 2, &indices, 0);
 
-            // Draw full geometry directly
+            // Draw full geometry directly without Input Layouts or traditional VBV binding
             g_CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g_CommandList->DrawInstanced(3, 1, 0, 0);
 
@@ -485,3 +489,41 @@ int main(int argc, char** argv)
     return 0;
 }
 
+// Win32 Window message handling function
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+}
+
+// Ensure complete graphics pipeline synchronization
+void WaitForGpu()
+{
+    g_CommandQueue->Signal(g_Fence.Get(), g_FenceValues[g_FrameIndex]);
+    g_Fence->SetEventOnCompletion(g_FenceValues[g_FrameIndex], g_FenceEvent);
+    WaitForSingleObjectEx(g_FenceEvent, INFINITE, FALSE);
+    g_FenceValues[g_FrameIndex]++;
+}
+
+// Frame pacing for the swap chain backbuffers
+void MoveToNextFrame()
+{
+    const UINT64 currentFenceValue = g_FenceValues[g_FrameIndex];
+    g_CommandQueue->Signal(g_Fence.Get(), currentFenceValue);
+
+    g_FrameIndex = g_SwapChain->GetCurrentBackBufferIndex();
+
+    if (g_Fence->GetCompletedValue() < g_FenceValues[g_FrameIndex])
+    {
+        g_Fence->SetEventOnCompletion(g_FenceValues[g_FrameIndex], g_FenceEvent);
+        WaitForSingleObjectEx(g_FenceEvent, INFINITE, FALSE);
+    }
+
+    g_FenceValues[g_FrameIndex] = currentFenceValue + 1;
+}
